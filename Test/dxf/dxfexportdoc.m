@@ -33,11 +33,12 @@
 %[text] - The view is along the Z axis of the document, 1:1 in mm. A DXF of a component has the origin and the axes of that component.
 %[text] - Per part the outer contour, as one closed `LWPOLYLINE`. A bevel or chamfer on the outside contributes only its widest edge.
 %[text] - Every edge of a wall perpendicular to the plate: holes, cut-outs, steps and pockets. Walls that are perpendicular but freeform are included. Arcs are kept as arcs (bulges) and full circles as `CIRCLE`.
-%[text] - The sketch curves, on their own layer, with the name and the color of the SpaceClaim layer. Lines that connect become one polyline.
+%[text] - Three layers, for the milling shop: `Basisplaat` (the sheet, from the sketch curves, lines that connect become one polyline), `Onderdelen` (outlines, cut-outs, steps, pockets and holes wider than 10 mm) and `Boorgaten` (full circles of 10 mm diameter or less).
 %[text] - Everything else is left out: lines inside a face, the inner edge of a bevel, a countersink rim, and a sloped wall inside the part. \
 %%
 %[text] ## What was found
 %[text] - A sloped wall inside a part is left out on purpose. It then shows up as a missing line, which points at a mistake in the design. A sloped wall on the outside is followed by the outer contour.
+%[text] - A groove or pocket that runs out at a bevelled edge cuts the outline back by a fraction of a millimeter. `dxf_engine.py` bridges such a dent, but only on a bevelled edge: the dent goes inward, the edge carries on in the same line, the sides of the dent are bevel edges (they change height), its bottom is a groove floor and it is no deeper than the bevel is wide. The edge stays straight; the walls of the groove still run up to it. Square edges and through-cuts are never touched.
 %[text] - A part of a component that itself has components is not supported; the script reports it and skips it.
 %[text] - Whether a hole goes through or is blind cannot be seen in the edges, so both are written. Concentric circles, such as a countersink, are written as well.
 %[text] - The end points of the edges of one part differ by about 0.0001 mm in SpaceClaim. `dxf_engine.py` merges points closer than 0.002 mm, otherwise the contours do not close.

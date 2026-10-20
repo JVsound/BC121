@@ -8,8 +8,8 @@ belong to one specific file go in that file as `% TODO: ...` or `# TODO: ...`.
 The main steps from idea to a built cabinet. BC121 is a hobby project: a gate is passed when the result is good enough,
 there is no formal sign-off.
 
-1. [ ] Fundamental base sketch of the horn (in progress; `Cad\BC121 Fundamental sketch.scdocx`)
-2. [ ] Base sketch to 3D design (`Cad\BC121.scdocx`)
+1. [x] Fundamental base sketch of the horn (in progress; `Cad\BC121 Fundamental sketch.scdocx`)
+2. [x] Base sketch to 3D design (`Cad\BC121.scdocx`)
 3. [ ] Validate the performance (JVsound toolbox with acoustic data from Ansys Mechanical, for example the maximum SPL
    at several positions)
 4. [ ] Make it buildable (`Cad\Cabinet Design`, the nesting and the DXF files for cutting)
@@ -25,4 +25,9 @@ there is no formal sign-off.
 ## Other
 
 - [ ] Simulate the maximum SPL at several positions with the JVsound Loudspeaker System Toolbox, using the acoustic data
-  from Ansys Mechanical
+  from Ansys Mechanical, for the four configurations of `Cad\BC121 Configuration overview.scdocx` (z = 0 is the
+  bottom plane)
+  - [ ] A: one cabinet lying, horn mouths to the side
+  - [ ] B: one cabinet upright, horn mouths at the bottom, close to the floor
+  - [ ] C: two cabinets in a row, horn mouths facing each other at the join
+  - [ ] D: two cabinets stacked, horn mouths to one side

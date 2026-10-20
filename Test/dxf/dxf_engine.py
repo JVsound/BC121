@@ -2,23 +2,24 @@
 1:1 in mm. One DXF per 'sheet' in the dump, named "<sheet name>.dxf", with the origin and axes of that sheet.
 
 Usage: python dxf_engine.py --dump dump.json --src model.scdocx --out-dir folder
-(--src is only read for the layer colours.) Run by the three sc_export_*.py scripts, not by hand.
+(--src is not used at the moment.) Run by the three sc_export_*.py scripts, not by hand.
 
-Per part the DXF gets, as LWPOLYLINEs (arcs as bulges) on layer "Layer0":
+Three layers: "Basisplaat" (the sheet, from the sketch curves), "Onderdelen" and "Boorgaten" (full circles with a
+diameter of 10 mm or less).
+
+Per part the DXF gets, as LWPOLYLINEs (arcs as bulges) on layer "Onderdelen":
 - the outer contour: the outline of everything the part covers when seen from above, so a bevel or chamfer on the
   outside contributes only its widest edge;
 - every edge of a wall perpendicular to the plate (a vertical plane or a cylinder along Z, also a freeform surface that
   stands vertical): cut-outs, holes, steps and pockets. Edges that only bound a sloped or curved face (the inner edge
   of a bevel, a countersink rim, a sloped wall inside the part) are dropped.
-Full circles that are wall edges become CIRCLE. Sketch curves go on their own SpaceClaim layer, lines joined to polylines.
+Full circles that are wall edges become CIRCLE. Sketch curves go on "Basisplaat", lines joined to polylines.
 """
 import argparse
 import json
 import math
 import os
 import re
-import xml.etree.ElementTree as ET
-import zipfile
 
 import ezdxf
 import shapely
@@ -28,7 +29,10 @@ from shapely.ops import linemerge, polygonize, unary_union
 SAG = 0.005  # mm, maximum deviation of the polygon from an arc while the outline is computed
 GRID = 1e-5  # mm, coordinates are snapped to this grid
 TOL_NODE = 2e-3  # mm, end points closer than this are the same corner (SpaceClaim's tolerance is about 1e-4 mm)
-LAYER = "Layer0"
+LAYER_BASE = "Basisplaat"  # the sheet (sketch curves)
+LAYER_PARTS = "Onderdelen"  # outlines, cut-outs, steps and pockets of the parts, and holes wider than HOLE_MAX
+LAYER_HOLES = "Boorgaten"  # full circles with a diameter of HOLE_MAX or less
+HOLE_MAX = 10.0  # mm, diameter
 
 
 def snap(p):
@@ -73,6 +77,13 @@ class Part:
 
     def __init__(self, edges):
         self.lines, self.circles, self.arcs, self.skipped = [], [], [], 0  # lines: [a, b, wall]; circles: [x, y, r, wall]
+        # edges that change height while they run in the plane: where a vertical wall meets a sloped (bevelled) side
+        # face; bevel is the longest of them, the width of the bevel seen from above
+        self.ramps, self.bevel = set(), 0.0
+        # edges at a constant height between the lowest and the highest edge of the part: the floor of a groove or pocket
+        self.floors = set()
+        heights = [e[k][2] for e in edges for k in ("start", "end")]
+        low, high = min(heights), max(heights)
         node = Nodes([snap(e[k]) for e in edges for k in ("start", "end")])
         seen_lines, seen_arcs, seen_curves = {}, {}, {}
         for e in edges:
@@ -81,6 +92,11 @@ class Part:
             if e["type"] == "Line":
                 if a == b:
                     continue
+                if abs(e["start"][2] - e["end"][2]) > 1e-6:  # metres
+                    self.ramps.add(frozenset((key(a), key(b))))
+                    self.bevel = max(self.bevel, math.dist(a, b))
+                elif low + 1e-6 < e["start"][2] < high - 1e-6:
+                    self.floors.add(frozenset((key(a), key(b))))
                 k = frozenset((a, b))  # the edge on the other side of the part is the same
                 if k in seen_lines:
                     self.lines[seen_lines[k]][2] |= wall
@@ -123,17 +139,59 @@ class Part:
                     seen_curves[frozenset((a, b))].append((mid, idx))
             else:
                 self.skipped += 1
+        self.merge_arcs()
 
     def add_arc(self, c, r, a, m, b, wall):
         counter = ccw(a, m, b)
         s, e = math.atan2(a[1] - c[1], a[0] - c[0]), math.atan2(b[1] - c[1], b[0] - c[0])
         sweep = (e - s) % (2 * math.pi) if counter else -((s - e) % (2 * math.pi))
-        n = max(2, math.ceil(abs(sweep) / (2 * math.acos(max(0.0, 1 - SAG / r)))))
-        pts = [a] + [snap_mm((c[0] + r * math.cos(s + sweep * i / n), c[1] + r * math.sin(s + sweep * i / n)))
-                     for i in range(1, n)] + [b]
-        arc = {"pts": pts, "counter": counter, "step": abs(sweep) / n, "wall": wall}
+        arc = {"c": c, "r": r, "counter": counter, "wall": wall, "a": a, "b": b, "s": s, "sweep": sweep}
         self.arcs.append(arc)
+        self.discretise(arc)
         return arc
+
+    @staticmethod
+    def discretise(arc):
+        c, r, s, sweep = arc["c"], arc["r"], arc["s"], arc["sweep"]
+        n = max(2, math.ceil(abs(sweep) / (2 * math.acos(max(0.0, 1 - SAG / r)))))
+        arc["pts"] = [arc["a"]] + [snap_mm((c[0] + r * math.cos(s + sweep * i / n), c[1] + r * math.sin(s + sweep * i / n)))
+                                   for i in range(1, n)] + [arc["b"]]
+        arc["step"] = abs(sweep) / n
+
+    def merge_arcs(self):
+        """Arcs on one circle (same centre, radius and wall flag) that overlap or touch become one arc.
+
+        SpaceClaim gives the bottom edge, the top edge and the floor of a groove of one cylindrical wall as separate
+        arcs; discretised apart they do not coincide, which leaves slivers and loose fragments."""
+        groups = {}
+        for arc in self.arcs:
+            groups.setdefault((round(arc["c"][0], 2), round(arc["c"][1], 2), round(arc["r"], 2), arc["wall"]), []).append(arc)
+        merged = []
+        for arcs in groups.values():
+            ivs = []  # [lo, hi, point at lo, point at hi], counter-clockwise from lo to hi
+            for arc in arcs:
+                lo, hi = (arc["s"], arc["s"] + arc["sweep"]) if arc["counter"] else (arc["s"] + arc["sweep"], arc["s"])
+                p_lo, p_hi = (arc["a"], arc["b"]) if arc["counter"] else (arc["b"], arc["a"])
+                shift = math.floor(lo / (2 * math.pi)) * 2 * math.pi
+                ivs.append([lo - shift, hi - shift, p_lo, p_hi])
+            ivs.sort(key=lambda v: v[0])
+            eps = TOL_NODE / arcs[0]["r"]
+            out = [ivs[0]]
+            for iv in ivs[1:]:
+                if iv[0] <= out[-1][1] + eps:
+                    if iv[1] > out[-1][1]:
+                        out[-1][1], out[-1][3] = iv[1], iv[3]
+                else:
+                    out.append(iv)
+            if len(out) > 1 and out[0][0] + 2 * math.pi <= out[-1][1] + eps:  # runs through the angle 0
+                out[0][0], out[0][2] = out[-1][0] - 2 * math.pi, out[-1][2]
+                out[0][1] = max(out[0][1], out[-1][1] - 2 * math.pi)
+                out.pop()
+            for lo, hi, p_lo, p_hi in out:
+                arc = dict(arcs[0], counter=True, a=p_lo, b=p_hi, s=lo, sweep=hi - lo)
+                self.discretise(arc)
+                merged.append(arc)
+        self.arcs = merged
 
     def segments(self, wall_only=False):
         segs = [(a, b) for a, b, w in self.lines if w or not wall_only]
@@ -197,6 +255,58 @@ def to_polyline(coords, closed, part, index):
     return res
 
 
+def bridge_notches(ring, part):
+    """Closed ring (first point repeated) without the dents that a bevelled edge gets from a groove.
+
+    A groove or pocket that runs out at a bevelled edge leaves a dent of a fraction of a millimetre in the outline
+    (the edge is cut at the depth of the groove floor, where the bevel lies further in). The edge itself runs on
+    straight, so such a dent is bridged: a chain of vertices that leaves a straight edge to the inside, comes back
+    onto the same line, is no deeper than the bevel is wide, whose first and last edge are bevel edges (they change
+    height, see Part.ramps) and whose bottom is the floor of a groove (Part.floors). Nothing happens on a part without
+    a bevel; dents to the outside (tabs) and through-cuts stay."""
+    pts = ring[:-1]
+    if not part.ramps:
+        return ring
+    area =sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(pts, pts[1:] + pts[:1]))
+    side = 1 if area > 0 else -1  # +1: the inside is on the left of the walking direction
+    changed = True
+    while changed and len(pts) > 4:
+        changed = False
+        n = len(pts)
+        for i in range(n):
+            a, b = pts[i], pts[(i + 1) % n]
+            length = math.dist(a, b)
+            if length < 1:
+                continue
+            d = ((b[0] - a[0]) / length, (b[1] - a[1]) / length)
+
+            def off(p):  # distance of p from the line through a and b, positive to the inside
+                return side * (d[0] * (p[1] - a[1]) - d[1] * (p[0] - a[0]))
+
+            for k in range(2, min(9, n - 2)):
+                e, f = pts[(i + k) % n], pts[(i + k + 1) % n]
+                length_ef = math.dist(e, f)
+                if length_ef < 1 or abs(off(e)) > 1e-3 or abs(off(f)) > 1e-3:
+                    continue
+                if (f[0] - e[0]) * d[0] + (f[1] - e[1]) * d[1] <= 0:
+                    continue  # the second edge does not carry on in the same direction
+                chain = [off(pts[(i + m) % n]) for m in range(1, k)]
+
+                def seg(j):  # the edge from vertex j to the next one
+                    return frozenset((key(pts[j % n]), key(pts[(j + 1) % n])))
+
+                if (max(chain) <= part.bevel + 1e-3 and min(chain) >= -1e-3 and max(chain) > 1e-3
+                        and seg(i + 1) in part.ramps and seg(i + k - 1) in part.ramps
+                        and all(seg(j) in part.floors for j in range(i + 2, i + k - 1))):
+                    drop = {(i + m) % n for m in range(1, k + 1)}
+                    pts = [p for j, p in enumerate(pts) if j not in drop]
+                    changed = True
+                    break
+            if changed:
+                break
+    return pts + pts[:1]
+
+
 def add_part(msp, part):
     index = part.arc_index()
     segs = part.segments()
@@ -206,10 +316,10 @@ def add_part(msp, part):
     outline = []
     if shape is not None:
         for poly in (shape.geoms if hasattr(shape, "geoms") else [shape]):
-            c = list(poly.exterior.coords)
+            c = bridge_notches(list(poly.exterior.coords), part)
             outline.append(c)
             msp.add_lwpolyline(to_polyline(c, True, part, index), format="xyb", close=True,
-                               dxfattribs={"layer": LAYER})
+                               dxfattribs={"layer": LAYER_PARTS})
     # plus the wall edges that are not on the outline (holes, cut-outs, steps); snapped first so that identical
     # edges have identical coordinates
     wall = part.segments(wall_only=True)
@@ -219,7 +329,7 @@ def add_part(msp, part):
             on_outline = unary_union(shapely.set_precision(
                 MultiLineString([s for c in outline for s in zip(c, c[1:])]), GRID))
             rest = rest.difference(on_outline)
-        merged = linemerge(rest) if not rest.is_empty else rest
+        merged = rest if rest.is_empty or rest.geom_type == "LineString" else linemerge(rest)
         for line in (merged.geoms if hasattr(merged, "geoms") else [merged]):
             if line.is_empty:
                 continue
@@ -227,17 +337,18 @@ def add_part(msp, part):
             closed = key(c[0]) == key(c[-1])
             pts = to_polyline(c, closed, part, index)
             if len(pts) >= 2:
-                msp.add_lwpolyline(pts, format="xyb", close=closed, dxfattribs={"layer": LAYER})
+                msp.add_lwpolyline(pts, format="xyb", close=closed, dxfattribs={"layer": LAYER_PARTS})
     for cx, cy, r, w in sorted(part.circles):
         if w and (shape is None or shape.buffer(TOL_NODE).contains(Point(cx, cy))):
-            msp.add_circle((cx, cy), r, dxfattribs={"layer": LAYER})
+            msp.add_circle((cx, cy), r, dxfattribs={"layer": LAYER_HOLES if 2 * r <= HOLE_MAX + TOL_NODE else LAYER_PARTS})
     if shape is None and part.circles and not any(c[3] for c in part.circles):
         cx, cy, r, _ = max(part.circles, key=lambda c: c[2])  # a round plate whose edge is not a wall: its widest circle
-        msp.add_circle((cx, cy), r, dxfattribs={"layer": LAYER})
+        msp.add_circle((cx, cy), r, dxfattribs={"layer": LAYER_PARTS})
 
 
 def add_sketch(msp, curves):
-    """Sketch curves (lines, arcs, circles) of one child: joined into polylines per layer, circles as CIRCLE."""
+    """Sketch curves (lines, arcs, circles) of one child, all on the layer of the sheet: joined into polylines,
+    circles as CIRCLE."""
     by_layer = {}
     zs = {round(p[2], 7) for cv in curves if cv.get("normal") is None for p in (cv["start"], cv["end"])}
     for cv in curves:
@@ -248,13 +359,15 @@ def add_sketch(msp, curves):
         if not flat:
             print("skipped a sketch curve that does not lie in a plane perpendicular to Z")
             continue
-        by_layer.setdefault(cv["layer"] or LAYER, []).append(dict(cv, wall=True))
+        by_layer.setdefault(LAYER_BASE, []).append(dict(cv, wall=True))
     for layer, edges in by_layer.items():
         part = Part(edges)
         index = part.arc_index()
         segs = part.segments()
         if segs:
-            merged = linemerge(unary_union(shapely.set_precision(MultiLineString(segs), GRID)))
+            merged = unary_union(shapely.set_precision(MultiLineString(segs), GRID))
+            if merged.geom_type != "LineString":
+                merged = linemerge(merged)
             for line in (merged.geoms if hasattr(merged, "geoms") else [merged]):
                 c = list(line.coords)
                 closed = key(c[0]) == key(c[-1])
@@ -266,34 +379,19 @@ def add_sketch(msp, curves):
             print(f"warning: {part.skipped} sketch curves were not converted")
 
 
-def layer_colors(src):
-    """SpaceClaim layer name -> (r, g, b)."""
-    with zipfile.ZipFile(src) as z:
-        root = ET.fromstring(z.read("SpaceClaim/document.xml"))
-    colors = {}
-    for e in root.iter():
-        if e.tag.rsplit("}", 1)[-1] == "LayerDef":
-            kids = {c.tag.rsplit("}", 1)[-1]: c.text for c in e}
-            colors[kids["name"]] = tuple(int(v) for v in kids["color"].split(","))
-    return colors
-
-
 def safe(name):
     return re.sub(r'[<>:"/\\|?*]', "_", name).strip(" .")
 
 
-def main(dump_file, src, out_dir):
+def main(dump_file, src, out_dir, suffix=""):
     os.makedirs(out_dir, exist_ok=True)
-    colors = layer_colors(src)
     with open(dump_file) as f:
         sheets = json.load(f)["sheets"]
     for sheet in sheets:
         doc = ezdxf.new("R2018")
         doc.units = ezdxf.units.MM
-        for name in {LAYER} | {cv["layer"] for cv in sheet["sketch"] if cv["layer"]}:
-            layer = doc.layers.add(name)
-            if name in colors:
-                layer.rgb = colors[name]
+        for name in (LAYER_BASE, LAYER_PARTS, LAYER_HOLES):
+            doc.layers.add(name).rgb = (0, 0, 0)  # all lines black
         doc.layers.discard("Defpoints")
         msp = doc.modelspace()
         skipped = 0
@@ -305,7 +403,7 @@ def main(dump_file, src, out_dir):
             part = Part(p["edges"])
             skipped += part.skipped
             add_part(msp, part)
-        path = os.path.join(out_dir, safe(sheet["name"]) + ".dxf")
+        path = os.path.join(out_dir, safe(sheet["name"] + suffix) + ".dxf")
         doc.saveas(path)
         print(f"{path}: {len(sheet['parts'])} parts, {len(msp)} entities" + (f", {skipped} edges skipped" if skipped else ""))
 
@@ -313,7 +411,8 @@ def main(dump_file, src, out_dir):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", required=True, help="JSON written by sc_common.py")
-    ap.add_argument("--src", required=True, help="the saved .scdocx, for the layer colours")
+    ap.add_argument("--src", required=True, help="the saved .scdocx (not used at the moment)")
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--suffix", default="", help="added to every file name, e.g. _2026-10-19")
     a = ap.parse_args()
-    main(a.dump, a.src, a.out_dir)
+    main(a.dump, a.src, a.out_dir, a.suffix)
