@@ -70,6 +70,86 @@ class Nodes:
         return p
 
 
+def place(e, node):
+    """Where an edge lies in the plan, whatever its height: the edge at the other side of the plate has the same."""
+    a, b = node(snap(e["start"])), node(snap(e["end"]))
+    if e["type"] == "Circle" and a == b:  # a full circle starts at another point at the other side of the plate
+        c = snap(e["origin"])
+        return ("Circle", round(c[0], 2), round(c[1], 2), round(e["radius"] * 1000, 2))
+    return (e["type"], frozenset((a, b)), round(e.get("radius", 0) * 1000, 1))
+
+
+def plan_segments(e, node):
+    """The edge as line segments in the plan (mm), only to find out which region it encloses."""
+    a, b = node(snap(e["start"])), node(snap(e["end"]))
+    if e["type"] == "Circle" and a == b:
+        c = snap(e["origin"])
+        ring = list(Point(c).buffer(e["radius"] * 1000, 16).exterior.coords)
+        return list(zip(ring, ring[1:]))
+    if e.get("pts"):
+        pts = [node(snap(p)) if i in (0, len(e["pts"]) - 1) else snap(p) for i, p in enumerate(e["pts"])]
+        return list(zip(pts, pts[1:]))
+    if e.get("mid"):
+        m = snap(e["mid"])
+        return [(a, m), (m, b)]
+    return [(a, b)] if a != b else []
+
+
+def back_walls(edges, node, high):
+    """The places (see place()) of walls that belong to milling from the back of the plate (the side at z = 0).
+
+    A wall is milled from the front when it reaches the top of the part (high), or when it stands in the floor of a
+    pocket from the front: a hole through that floor runs from the floor level downwards, and is a hole all the same.
+    Everything else (a pocket or blind hole that starts at the underside) is left out."""
+    eps = 1e-6
+    groups = {}
+    for e in edges:
+        if not e.get("wall"):
+            continue
+        a, b = node(snap(e["start"])), node(snap(e["end"]))
+        if e["type"] != "Circle" and a == b:  # a vertical edge, no length in the plan
+            continue
+        g = groups.setdefault(place(e, node), {"lo": e["start"][2], "hi": e["start"][2], "edges": []})
+        g["lo"] = min(g["lo"], e["start"][2], e["end"][2])
+        g["hi"] = max(g["hi"], e["start"][2], e["end"][2])
+        g["edges"].append(e)
+    # edges that leave a point of the plan vertically or on a slope: (height here, height at the other end)
+    leaving = {}
+    for e in edges:
+        a, b = node(snap(e["start"])), node(snap(e["end"]))
+        za, zb = e["start"][2], e["end"][2]
+        if e["type"] == "Line" and abs(za - zb) > eps:
+            leaving.setdefault(a, []).append((za, zb))
+            leaving.setdefault(b, []).append((zb, za))
+    # floor level (mm) -> plan segments of the edges at that height that have a wall going up from them: the floor of a
+    # pocket from the front, also when the wall at the top lies somewhat further out (a bevelled edge)
+    levels = {}
+    for e in edges:
+        z = e["start"][2]
+        if abs(z - e["end"][2]) < eps:
+            for p in (node(snap(e["start"])), node(snap(e["end"]))):
+                if any(abs(zh - z) < eps and zo > z + eps for zh, zo in leaving.get(p, [])):
+                    levels.setdefault(round(z * 1000, 1), []).extend(plan_segments(e, node))
+                    break
+    regions = {}
+    for level, segs in levels.items():
+        regions[level] = list(polygonize(unary_union(shapely.set_precision(MultiLineString(segs), GRID))))
+    back = set()
+    for pl, g in groups.items():
+        if g["hi"] >= high - eps:
+            continue
+        e = g["edges"][0]
+        a, b = node(snap(e["start"])), node(snap(e["end"]))
+        if e["type"] == "Circle" and a == b:
+            p = Point(snap(e["origin"]))
+        else:
+            m = snap(e["mid"]) if e.get("mid") else ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+            p = Point(m)
+        if not any(poly.buffer(TOL_NODE).contains(p) for poly in regions.get(round(g["hi"] * 1000, 1), [])):
+            back.add(pl)
+    return back
+
+
 class Part:
     """Lines, discretised arcs, sampled curves and full circles of one part in mm, seen along Z.
 
@@ -86,8 +166,9 @@ class Part:
         low, high = min(heights), max(heights)
         node = Nodes([snap(e[k]) for e in edges for k in ("start", "end")])
         seen_lines, seen_arcs, seen_curves = {}, {}, {}
+        back = back_walls(edges, node, high)
         for e in edges:
-            wall = bool(e.get("wall"))
+            wall = bool(e.get("wall")) and place(e, node) not in back
             a, b = node(snap(e["start"])), node(snap(e["end"]))
             if e["type"] == "Line":
                 if a == b:

@@ -38,6 +38,7 @@
 %%
 %[text] ## What was found
 %[text] - A sloped wall inside a part is left out on purpose. It then shows up as a missing line, which points at a mistake in the design. A sloped wall on the outside is followed by the outer contour.
+%[text] - Only the front (the +Z side of the plate) is milled: walls of pockets and blind holes from the back are left out. Only heights are used (the direction of a face normal in SpaceClaim is not reliable). A wall is kept when it reaches the top of the part, or when it stands in the floor of a pocket from the front: a hole through that floor runs from the floor level downwards and stays. The floor is found from the edges at that height that have a vertical or sloped edge going up from them, so it also works at a bevelled edge.
 %[text] - A groove or pocket that runs out at a bevelled edge cuts the outline back by a fraction of a millimeter. `dxf_engine.py` bridges such a dent, but only on a bevelled edge: the dent goes inward, the edge carries on in the same line, the sides of the dent are bevel edges (they change height), its bottom is a groove floor and it is no deeper than the bevel is wide. The edge stays straight; the walls of the groove still run up to it. Square edges and through-cuts are never touched.
 %[text] - A part of a component that itself has components is not supported; the script reports it and skips it.
 %[text] - Whether a hole goes through or is blind cannot be seen in the edges, so both are written. Concentric circles, such as a countersink, are written as well.
